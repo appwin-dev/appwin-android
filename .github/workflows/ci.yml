@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Gradle build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # AGP 8 accepte 17 à 21 et pas au-delà : version figée ici plutôt
+          # que laissée au runner, qui la fait monter sans prévenir.
+          java-version: '21'
+          cache: gradle
+      - name: Build
+        run: ./gradlew build --no-daemon
