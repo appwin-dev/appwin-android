@@ -1,0 +1,323 @@
+package io.appwin.core
+
+import android.content.Context
+import io.appwin.core.identity.DeviceInfo
+import io.appwin.core.identity.IdentityStore
+import io.appwin.core.identity.SecureStore
+import io.appwin.core.availability.AppwinInitResult
+import io.appwin.core.availability.AppwinProduct
+import io.appwin.core.availability.AvailabilityStore
+import io.appwin.core.network.ApiClient
+import io.appwin.core.network.AppwinApiException
+import io.appwin.core.network.HttpMethod
+import io.appwin.core.network.RealtimeHub
+import io.appwin.core.push.PushTokenBody
+import io.appwin.core.session.AuthSession
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.UUID
+
+/**
+ * Shared foundation for every Appwin product module on Android.
+ *
+ * Firebase-style: the host app calls [configure] once at launch, then the
+ * product modules read [client] and [deviceId].
+ *
+ * The contract deliberately mirrors the iOS Core - same names, same
+ * guarantees, same headers. A behavioural difference between the two is a bug,
+ * not a platform variant.
+ *
+ * ```kotlin
+ * class MyApp : Application() {
+ *   override fun onCreate() {
+ *     super.onCreate()
+ *     AppwinCore.configure(this, projectAppId = "your-app-id")
+ *   }
+ * }
+ * ```
+ */
+public object AppwinCore {
+  /** Reported to the server for diagnostics. */
+  public const val VERSION: String = "0.1.0-dev"
+
+  private const val DEVICE_ID_KEY = "appwin.core.deviceId"
+
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  private val bootstrapMutex = Mutex()
+
+  private var secureStore: SecureStore? = null
+  private var availabilityStore: AvailabilityStore? = null
+  private var inFlightBootstrap: Deferred<String>? = null
+  private var realtimeHub: RealtimeHub? = null
+  private var pushTokenRegistered = false
+
+  public var baseUrl: String = "https://api.appwin.io"
+    private set
+
+  /** Realtime service base URL. A **separate** service from the API. */
+  public var realtimeBaseUrl: String = "https://ws.appwin.io"
+    private set
+
+  public var deviceInfo: DeviceInfo? = null
+    private set
+
+  /** Canonical HTTP client, `null` until [configure] has run. */
+  public var client: ApiClient? = null
+    private set
+
+  /** Public project app id, shared across every product. */
+  public val projectAppId: String?
+    get() = IdentityStore.snapshot().projectAppId
+
+  /** Stable device id, persisted across launches. */
+  public val deviceId: String?
+    get() = IdentityStore.snapshot().deviceId
+
+  /** User id supplied by the host app. `null` means anonymous. */
+  public val externalId: String?
+    get() = IdentityStore.snapshot().externalId
+
+  /** Whether [registerPushToken] has succeeded at least once this process. */
+  public val hasRegisteredPushToken: Boolean
+    get() = pushTokenRegistered
+
+  /**
+   * Call once at launch, before using any product module. Idempotent.
+   *
+   * Synchronous: it prepares the device identity and network client right
+   * away, then opens the session in the background so the app keeps starting.
+   * Await [bootstrapSession] to require an open session.
+   *
+   * @param context only the application context is retained, never an
+   *   activity - the SDK outlives them.
+   * @param projectAppId public project id, found in the studio.
+   * @param baseUrl API URL override, for development.
+   * @param realtimeBaseUrl realtime service URL override.
+   */
+  @JvmStatic
+  @JvmOverloads
+  public fun configure(
+    context: Context,
+    projectAppId: String,
+    baseUrl: String? = null,
+    realtimeBaseUrl: String? = null,
+  ) {
+    require(projectAppId.isNotBlank()) { "projectAppId must not be blank" }
+
+    baseUrl?.let { this.baseUrl = it.trimEnd('/') }
+    realtimeBaseUrl?.let { this.realtimeBaseUrl = it.trimEnd('/') }
+
+    val store = SecureStore(context)
+    secureStore = store
+    // Keyed by appId: two apps on the same device must not read each
+    // other's verdict.
+    availabilityStore = AvailabilityStore(context, projectAppId)
+
+    val deviceId = store.get(DEVICE_ID_KEY) ?: UUID.randomUUID().toString().also {
+      store.set(DEVICE_ID_KEY, it)
+    }
+
+    IdentityStore.mutate { it.copy(projectAppId = projectAppId, deviceId = deviceId) }
+    deviceInfo = DeviceInfo.current(context)
+
+    client = ApiClient(baseUrl = this.baseUrl, headersProvider = ::canonicalHeaders)
+
+    scope.launch { runCatching { bootstrapSession() } }
+  }
+
+  /**
+   * Opens the server session and returns the token.
+   *
+   * Concurrent callers share the **same** network call. Not an optimisation:
+   * `/auth/init` rotates the token and invalidates the previous one, so two
+   * simultaneous inits - the one [configure] spawns and an explicitly awaited
+   * one - revoke each other's token, which shows up as intermittent 401s at
+   * startup.
+   */
+
+  /**
+   * Whether this app may open [product], as the server sees it.
+   *
+   * Called by each product's `initialize()`; a host app has no reason to call
+   * it directly. One shared request answers for all three products, and the
+   * verdict is cached on disk so a launch without network falls back to the
+   * last known answer rather than locking a paying studio out.
+   */
+  @JvmStatic
+  public suspend fun availability(product: AppwinProduct): AppwinInitResult {
+    val api = client ?: return AppwinInitResult.NotConfigured
+    val store = availabilityStore ?: return AppwinInitResult.NotConfigured
+
+    // Wait for the session first. `configure` returns before the bearer exists
+    // - deliberately, so an offline app still starts fast - and this endpoint
+    // is bearer-only. Called straight after `configure`, which is exactly what
+    // the documented sequence tells a studio to do, the request would 401 and
+    // report `Unknown`: "offline on a first launch" for an app that is online.
+    //
+    // Idempotent and shared between concurrent callers, so the three products
+    // initialising at once still cost one round trip.
+    runCatching { bootstrapSession() }
+
+    return store.status(product, api)
+  }
+
+  public suspend fun bootstrapSession(externalId: String? = null): String {
+    val appId = projectAppId ?: throw AppwinApiException.NotConfigured()
+    val deviceId = deviceId ?: throw AppwinApiException.NotConfigured()
+
+    val task = bootstrapMutex.withLock {
+      inFlightBootstrap ?: scope.async {
+        AuthSession.bootstrap(
+          baseUrl = baseUrl,
+          appId = appId,
+          deviceId = deviceId,
+          externalId = externalId ?: this@AppwinCore.externalId,
+          deviceInfo = deviceInfo,
+          sdkVersion = VERSION,
+          store = secureStore,
+        )
+      }.also { inFlightBootstrap = it }
+    }
+
+    return try {
+      task.await()
+    } finally {
+      bootstrapMutex.withLock {
+        if (inFlightBootstrap === task) inFlightBootstrap = null
+      }
+    }
+  }
+
+  /**
+   * Attaches the device to the host app's user. The identity is shared by
+   * every active product module.
+   */
+  @JvmStatic
+  public fun identify(externalId: String) {
+    IdentityStore.mutate { it.copy(externalId = externalId) }
+  }
+
+  /** Goes back to anonymous locally, without revoking the server session. */
+  @JvmStatic
+  public fun clearIdentity() {
+    IdentityStore.mutate { it.copy(externalId = null) }
+  }
+
+  /**
+   * Revokes the session server-side, clears the local token and goes back to
+   * anonymous. Call it when the user signs out of **your** app, otherwise the
+   * next person on the device inherits their identity.
+   */
+  public suspend fun signOut() {
+    AuthSession.signOut(baseUrl, secureStore)
+    IdentityStore.mutate { it.copy(externalId = null) }
+  }
+
+  /**
+   * Registers this device's push token with Appwin. Call again on every token
+   * rotation.
+   *
+   * Uses the Support route so the same table is updated without requiring the
+   * Notifications product to be enabled. Shared by Support, Community and
+   * Notifications.
+   *
+   * Set [pushOptIn] to `false` rather than stopping registration: that
+   * distinguishes "declined" from "never asked".
+   */
+  @JvmStatic
+  @JvmOverloads
+  public suspend fun registerPushToken(
+    token: String,
+    platform: String = "android",
+    pushOptIn: Boolean = true,
+  ) {
+    require(token.isNotBlank()) { "token must not be blank" }
+    val api = client ?: throw AppwinApiException.NotConfigured()
+    api.requestVoid(
+      path = "/api/sdk/support/v1/push-token",
+      method = HttpMethod.POST,
+      body = ApiClient.json.encodeToString(
+        PushTokenBody.serializer(),
+        PushTokenBody(token = token, platform = platform, pushOptIn = pushOptIn),
+      ),
+    )
+    pushTokenRegistered = true
+  }
+
+  /**
+   * Reminds integrators to register the push token through [registerPushToken].
+   *
+   * Optional for Support and Community, required for Notifications. A missing
+   * token does not block initialization: we log so the omission shows up during
+   * integration, not in production silence.
+   */
+  @JvmStatic
+  public fun reportMissingPushToken(product: AppwinProduct) {
+    if (pushTokenRegistered) return
+    val requirement =
+      when (product) {
+        AppwinProduct.NOTIFICATIONS -> "required"
+        else -> "strongly recommended"
+      }
+    android.util.Log.w(
+      "Appwin",
+      "Push token not registered yet ($requirement for ${product.key}). " +
+        "Call AppwinCore.registerPushToken(...) after configure, and again on " +
+        "every FCM/APNs token rotation.",
+    )
+  }
+
+  /**
+   * Headers added to every outgoing request.
+   *
+   * The legacy `X-Appwin-*` headers are sent alongside the bearer: the server
+   * accepts both, and they are what lets the earliest calls succeed while the
+   * bootstrap is still in flight.
+   */
+  @JvmStatic
+  public fun canonicalHeaders(): Map<String, String> {
+    val identity = IdentityStore.snapshot()
+    val headers = LinkedHashMap<String, String>(6)
+    headers["Content-Type"] = "application/json"
+    headers["X-Appwin-Platform"] = "android"
+    identity.projectAppId?.let { headers["X-Appwin-App-Id"] = it }
+    identity.deviceId?.let { headers["X-Appwin-Device-Id"] = it }
+    identity.externalId?.let { headers["X-Appwin-User-Id"] = it }
+    AuthSession.currentToken(secureStore)?.let { headers["Authorization"] = "Bearer $it" }
+    return headers
+  }
+
+  /**
+   * Shared realtime hub (ADR-0028 §9): one multiplexed WebSocket for the whole
+   * app. Created on first access, `null` until [configure] has run.
+   */
+  @JvmStatic
+  public fun realtimeHub(): RealtimeHub? {
+    realtimeHub?.let { return it }
+    val api = client ?: return null
+    var ws = realtimeBaseUrl
+      .replace("https://", "wss://")
+      .replace("http://", "ws://")
+    if (!ws.endsWith("/ws")) ws += "/ws"
+    return RealtimeHub.make(gatewayUrl = ws, api = api).also { realtimeHub = it }
+  }
+
+  /** Test-only: the object is a singleton, so one test would leak into the next. */
+  internal fun resetForTesting() {
+    IdentityStore.reset()
+    secureStore = null
+    client = null
+    deviceInfo = null
+    inFlightBootstrap = null
+    realtimeHub = null
+    pushTokenRegistered = false
+    baseUrl = "https://api.appwin.io"
+    realtimeBaseUrl = "https://ws.appwin.io"
+  }
+}
