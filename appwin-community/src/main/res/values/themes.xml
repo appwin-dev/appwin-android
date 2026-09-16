@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Window theme only: Compose paints the surface.
+      A platform parent rather than AppCompat, so the SDK does not force an
+      extra dependency on the apps that integrate it.
+    -->
+    <style name="Theme.Appwin.Sdk" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+</resources>
