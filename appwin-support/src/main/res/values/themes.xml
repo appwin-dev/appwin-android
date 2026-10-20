@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Window theme only: Compose paints the surface.
+      A platform parent rather than AppCompat, so the SDK does not force an
+      extra dependency on the apps that integrate it.
+    -->
+    <style name="Theme.Appwin.Sdk" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+
+    <!--
+      The messenger floats over the host app as a sheet, so its activity must
+      not paint a window of its own: without windowIsTranslucent the platform
+      draws an opaque backdrop and the host app disappears behind it.
+      windowAnimationStyle is dropped because the sheet animates itself - the
+      default activity slide would play on top of it and read as two motions.
+    -->
+    <style name="Theme.Appwin.Sdk.Sheet" parent="Theme.Appwin.Sdk">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
