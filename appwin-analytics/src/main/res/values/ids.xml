@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- View tag read by the session replay masking: TRUE masks, FALSE unmasks. -->
+  <item name="appwin_replay_mask" type="id" />
+</resources>
